@@ -1,14 +1,53 @@
 name: urchin tests
 
-on: [push, pull_request]
+# racecar fork-testbed patch. Changes from upstream:
+#   1. workflow_dispatch with leg/profile/racecar_run inputs, so racecar can
+#      trigger a run and choose baseline vs instrumented. Upstream only fires on
+#      push/PR, which racecar cannot drive.
+#   2. actions/checkout -> crashappsec/action-checkout, which wraps checkout and
+#      setup-chalk-action together (the internal pattern, cf. dummy-deployments).
+#   3. permissions: id-token: write for the action's OIDC connect, restated in
+#      the `tests` job because a job-level block replaces the workflow-level one
+#      outright rather than merging with it.
+#   4. A fail-closed assertion on the instrumented arm.
+# No macOS/Windows legs existed. The 13-entry shell x suite matrix is untouched,
+# and the build and test COMMANDS are byte-identical to upstream.
+
+on:
+  workflow_dispatch:
+    inputs:
+      leg:
+        description: "baseline (uninstrumented) or instrumented (under chalk/curiosity)"
+        type: choice
+        options: [instrumented, baseline]
+        default: instrumented
+      profile:
+        description: "CrashOverride chalk profile"
+        type: string
+        default: curiosity-tests-racecar
+      racecar_run:
+        description: "racecar correlation token, echoed into the run name"
+        type: string
+        default: ""
+  push:
+  pull_request:
+
+run-name: "urchin tests ${{ inputs.leg || 'push' }} ${{ inputs.racecar_run }}"
 
 permissions:
   contents: read
+  id-token: write
+
+env:
+  # The one variable that separates the arms. On baseline, action-checkout skips
+  # its Set up Chalk step entirely.
+  CHALK_ON: ${{ github.event_name == 'workflow_dispatch' && inputs.leg != 'baseline' }}
 
 jobs:
   tests:
     permissions:
       contents: read  # for actions/checkout@v6
+      id-token: write # for action-checkout's OIDC connect
 
     name: "tests"
     runs-on: ubuntu-latest
@@ -53,7 +92,29 @@ jobs:
             iojs.org:443
             azure.archive.ubuntu.com:80
             packages.microsoft.com:443
-      - uses: actions/checkout@v6
+      - uses: crashappsec/action-checkout@main
+        with:
+          chalk: ${{ env.CHALK_ON }}
+          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+          # Default is best-effort; a silently-uninstrumented run is a corrupt
+          # data point rather than a degraded one, so fail closed.
+          observables_continue_on_error: false
+          # Upstream used actions/checkout, which does not fetch LFS.
+          lfs: false
+
+      # Assert on the host-server socket, NOT on LD_PRELOAD: co-monitor's loader
+      # clears LD_PRELOAD once it has injected, so an empty LD_PRELOAD inside the
+      # shell is what SUCCESS looks like. pgrep is no good either -- co-hostd
+      # daemonizes under another name. shell: bash so the assertion does not run
+      # through the job's `script`/matrix-shell wrapper, matching how upstream
+      # pins its own shell-agnostic steps below.
+      - name: Assert instrumentation is live
+        if: env.CHALK_ON == 'true'
+        shell: bash
+        run: |
+          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
+          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+
       - run: sudo apt-get update; sudo apt-get install ${{ matrix.shell }}
         if: matrix.shell == 'zsh' || matrix.shell == 'ksh'
         # zsh (https://github.com/actions/runner-images/issues/264) and ksh are not in the ubuntu image
